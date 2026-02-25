@@ -2,115 +2,137 @@ import type { BrowserContext, Page } from "playwright-core";
 import { logger } from "../utils/logger.js";
 
 /**
- * The init script that monkey-patches getUserMedia BEFORE Meet loads.
- * It intercepts the mic stream request and returns a MediaStreamDestination
- * we control. When we want to "speak", we decode WAV audio and play it
- * through that destination — which flows into WebRTC → other participants.
+ * Init script: tracks all RTCPeerConnection instances so we can
+ * find and replace their audio tracks after joining a meeting.
+ * Does NOT touch getUserMedia — lets Meet set up normally.
  */
-const AUDIO_INIT_SCRIPT = `
+const TRACK_RTC_SCRIPT = `
 (function() {
-  // Save original
-  const _origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  window.__rtcConnections = [];
+  const _OrigRTC = window.RTCPeerConnection;
 
-  // Lazy-init audio context (Chrome requires user gesture, but fake-ui flag bypasses)
-  let _ctx = null;
-  let _dest = null;
-  let _gain = null;
-
-  function ensureCtx() {
-    if (!_ctx) {
-      _ctx = new AudioContext({ sampleRate: 48000 });
-      _dest = _ctx.createMediaStreamDestination();
-      _gain = _ctx.createGain();
-      _gain.gain.value = 1.0;
-      _gain.connect(_dest);
-    }
-    if (_ctx.state === 'suspended') _ctx.resume();
-    return { ctx: _ctx, dest: _dest, gain: _gain };
-  }
-
-  // Monkey-patch getUserMedia
-  navigator.mediaDevices.getUserMedia = async function(constraints) {
-    if (constraints && constraints.audio) {
-      const { dest } = ensureCtx();
-      const audioTracks = dest.stream.getAudioTracks();
-
-      if (constraints.video) {
-        // Get video from original, combine with our audio
-        try {
-          const vidStream = await _origGetUserMedia({ video: constraints.video });
-          return new MediaStream([...audioTracks, ...vidStream.getVideoTracks()]);
-        } catch(e) {
-          return new MediaStream(audioTracks);
-        }
-      }
-      return new MediaStream(audioTracks);
-    }
-    return _origGetUserMedia(constraints);
+  window.RTCPeerConnection = function() {
+    const pc = new _OrigRTC(...arguments);
+    window.__rtcConnections.push(pc);
+    return pc;
   };
+  window.RTCPeerConnection.prototype = _OrigRTC.prototype;
 
-  // Also patch enumerateDevices to report a fake mic so Meet shows mic controls
-  const _origEnumDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-  navigator.mediaDevices.enumerateDevices = async function() {
-    const devices = await _origEnumDevices();
-    // If no audio input, add a fake one
-    const hasAudioInput = devices.some(d => d.kind === 'audioinput');
-    if (!hasAudioInput) {
-      devices.push({
-        deviceId: 'gmeet-mcp-mic',
-        groupId: 'gmeet-mcp',
-        kind: 'audioinput',
-        label: 'gmeet-mcp Virtual Microphone',
-        toJSON() { return this; }
-      });
-    }
-    return devices;
-  };
-
-  // Expose: play a base64-encoded WAV and return duration
-  window.__gmeetPlayAudio = async function(base64Wav) {
-    const { ctx, gain } = ensureCtx();
-
-    // Decode base64 → ArrayBuffer
-    const bin = atob(base64Wav);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-
-    // Decode audio
-    const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0));
-
-    // Play through gain → dest → MediaStream → WebRTC → participants
-    return new Promise(function(resolve, reject) {
-      try {
-        const src = ctx.createBufferSource();
-        src.buffer = audioBuf;
-        src.connect(gain);
-        src.onended = function() { resolve(audioBuf.duration); };
-        src.start();
-      } catch(e) {
-        reject(e);
-      }
-    });
-  };
-
-  // Expose: check readiness
-  window.__gmeetAudioReady = function() {
-    return {
-      hasContext: !!_ctx,
-      state: _ctx ? _ctx.state : 'none',
-      tracks: _dest ? _dest.stream.getAudioTracks().length : 0
-    };
-  };
+  // Copy static properties
+  Object.keys(_OrigRTC).forEach(function(k) {
+    try { window.RTCPeerConnection[k] = _OrigRTC[k]; } catch(e) {}
+  });
 })();
 `;
 
 /**
- * Injects the audio stream monkey-patch into a browser context.
- * Must be called BEFORE navigating to Meet.
+ * Inject the RTC tracker before any page loads.
  */
 export async function injectAudioStream(context: BrowserContext): Promise<void> {
-  await context.addInitScript(AUDIO_INIT_SCRIPT);
-  logger.info("Audio stream init script injected into context");
+  await context.addInitScript(TRACK_RTC_SCRIPT);
+  logger.info("RTC tracker init script injected");
+}
+
+/**
+ * After joining the meeting, take over the audio track on the
+ * RTCPeerConnection by replacing it with a MediaStreamDestination
+ * we control via Web Audio API.
+ */
+export async function takeOverAudioTrack(page: Page): Promise<void> {
+  const result = await page.evaluate(() => {
+    const pcs = (window as any).__rtcConnections as RTCPeerConnection[] | undefined;
+    if (!pcs || pcs.length === 0) return { error: "No RTCPeerConnections found" };
+
+    // Find the connection that has an audio sender
+    let audioSender: RTCRtpSender | null = null;
+    let activePc: RTCPeerConnection | null = null;
+
+    for (const pc of pcs) {
+      if (pc.connectionState === "closed") continue;
+      const senders = pc.getSenders();
+      for (const s of senders) {
+        if (s.track && s.track.kind === "audio") {
+          audioSender = s;
+          activePc = pc;
+          break;
+        }
+      }
+      if (audioSender) break;
+    }
+
+    if (!audioSender || !activePc) {
+      return { error: "No audio sender found on any RTCPeerConnection" };
+    }
+
+    // Create our audio pipeline
+    const ctx = new AudioContext({ sampleRate: 48000 });
+    const dest = ctx.createMediaStreamDestination();
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
+    gain.connect(dest);
+
+    // Replace the audio track on the sender
+    const newTrack = dest.stream.getAudioTracks()[0];
+    audioSender.replaceTrack(newTrack);
+
+    // Store globally for playback
+    (window as any).__gmeetAudioCtx = ctx;
+    (window as any).__gmeetAudioGain = gain;
+    (window as any).__gmeetAudioDest = dest;
+
+    // Expose play function
+    (window as any).__gmeetPlayAudio = async function (base64Wav: string): Promise<number> {
+      const ctx = (window as any).__gmeetAudioCtx as AudioContext;
+      const gain = (window as any).__gmeetAudioGain as GainNode;
+
+      if (ctx.state === "suspended") await ctx.resume();
+
+      // Decode base64 → ArrayBuffer
+      const bin = atob(base64Wav);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+      const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0));
+
+      return new Promise<number>((resolve, reject) => {
+        try {
+          const src = ctx.createBufferSource();
+          src.buffer = audioBuf;
+          src.connect(gain);
+          src.onended = () => resolve(audioBuf.duration);
+          src.start();
+        } catch (e: any) {
+          reject(e);
+        }
+      });
+    };
+
+    // Expose readiness check
+    (window as any).__gmeetAudioReady = function () {
+      const ctx = (window as any).__gmeetAudioCtx as AudioContext;
+      const dest = (window as any).__gmeetAudioDest as MediaStreamAudioDestinationNode;
+      return {
+        hasContext: !!ctx,
+        state: ctx ? ctx.state : "none",
+        tracks: dest ? dest.stream.getAudioTracks().length : 0,
+        pcState: activePc!.connectionState,
+      };
+    };
+
+    return {
+      ok: true,
+      pcState: activePc.connectionState,
+      audioCtxState: ctx.state,
+      trackId: newTrack.id,
+    };
+  });
+
+  if ("error" in result) {
+    logger.error("Failed to take over audio track", { error: result.error });
+    throw new Error(result.error as string);
+  }
+
+  logger.info("Audio track replaced on RTCPeerConnection", result as Record<string, unknown>);
 }
 
 /**
@@ -120,17 +142,9 @@ export async function injectAudioStream(context: BrowserContext): Promise<void> 
 export async function playAudioInPage(page: Page, wavBuffer: Buffer): Promise<number> {
   const base64 = wavBuffer.toString("base64");
 
-  // Ensure AudioContext is running
-  await page.evaluate(() => {
-    const ready = (window as any).__gmeetAudioReady?.();
-    if (ready?.state === "suspended") {
-      // Try to resume
-    }
-  });
-
   const duration = await page.evaluate(async (b64: string) => {
     const playFn = (window as any).__gmeetPlayAudio;
-    if (!playFn) throw new Error("Audio stream not initialized — __gmeetPlayAudio not found");
+    if (!playFn) throw new Error("Audio not initialized — call takeOverAudioTrack first");
     return await playFn(b64);
   }, base64);
 

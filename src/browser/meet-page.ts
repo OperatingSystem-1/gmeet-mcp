@@ -2,6 +2,7 @@ import type { Page } from "playwright-core";
 import { SELECTORS } from "./meet-selectors.js";
 import { injectCaptionObserver, getCaptionBuffer, type CaptionEntry } from "./caption-observer.js";
 import { injectChatObserver, getChatBuffer, type ChatMessage } from "./chat-observer.js";
+import { takeOverAudioTrack } from "../audio/stream-injector.js";
 import { logger } from "../utils/logger.js";
 import { MeetError } from "../utils/errors.js";
 import { retry } from "../utils/retry.js";
@@ -51,6 +52,17 @@ export class MeetPage {
     // Inject observers
     await injectCaptionObserver(this.page);
     await injectChatObserver(this.page);
+
+    // Take over the audio track on the WebRTC connection
+    // so we can stream TTS audio to all participants
+    try {
+      await takeOverAudioTrack(this.page);
+      logger.info("Audio track takeover successful");
+    } catch (err) {
+      logger.warn("Audio track takeover failed — TTS speak will not work", {
+        error: String(err),
+      });
+    }
 
     logger.info("Successfully joined meeting");
   }
