@@ -1,79 +1,57 @@
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
-import { createSilentWav, estimateDuration } from "./wav-utils.js";
+import type { Page } from "playwright-core";
+import { playAudioInPage } from "./stream-injector.js";
 import { logger } from "../utils/logger.js";
 
 /**
- * Manages the WAV file that Chrome reads via --use-file-for-fake-audio-capture.
+ * Plays audio into a Google Meet call via the Web Audio API bridge.
  *
- * Chrome continuously reads this file in a loop. To "speak", we overwrite it
- * with TTS audio, wait for the duration, then overwrite with silence again.
+ * Audio is sent as base64 WAV to the page, decoded by the browser's
+ * Web Audio API, and played through a MediaStreamDestination that
+ * feeds the WebRTC peer connection — so all participants hear it.
  */
 export class AudioInjector {
-  private filePath: string;
+  private page: Page | null = null;
   private isPlaying = false;
-  private queue: Array<{ wavData: Buffer; resolve: () => void }> = [];
+  private queue: Array<{ wavData: Buffer; resolve: (duration: number) => void; reject: (err: Error) => void }> = [];
 
-  constructor() {
-    const dir = join(tmpdir(), "gmeet-mcp");
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    this.filePath = join(dir, `audio-${randomUUID().slice(0, 8)}.wav`);
+  setPage(page: Page) {
+    this.page = page;
   }
 
-  getFilePath(): string {
-    return this.filePath;
-  }
-
-  async writeSilence(durationSeconds: number = 1): Promise<void> {
-    const wav = createSilentWav(durationSeconds);
-    writeFileSync(this.filePath, wav);
-  }
-
-  async injectAudio(wavData: Buffer): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.queue.push({ wavData, resolve });
+  async injectAudio(wavData: Buffer): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      this.queue.push({ wavData, resolve, reject });
       this.processQueue();
     });
   }
 
   private async processQueue(): Promise<void> {
     if (this.isPlaying || this.queue.length === 0) return;
+    if (!this.page) {
+      const item = this.queue.shift();
+      item?.reject(new Error("No page set on AudioInjector"));
+      return;
+    }
 
     this.isPlaying = true;
-    const { wavData, resolve } = this.queue.shift()!;
+    const { wavData, resolve, reject } = this.queue.shift()!;
 
     try {
-      const duration = estimateDuration(wavData);
-      logger.info("Injecting audio", { durationSeconds: duration.toFixed(2) });
-
-      // Write the TTS audio
-      writeFileSync(this.filePath, wavData);
-
-      // Wait for Chrome to play through the audio
-      // Add a small buffer for Chrome's read cycle
-      await new Promise((r) => setTimeout(r, (duration + 0.5) * 1000));
-
-      // Restore silence
-      await this.writeSilence(1);
+      logger.info("Injecting audio via Web Audio API", { bytes: wavData.length });
+      const duration = await playAudioInPage(this.page, wavData);
+      logger.info("Audio playback complete", { durationSeconds: duration.toFixed(2) });
+      resolve(duration);
     } catch (err) {
       logger.error("Audio injection failed", { error: String(err) });
+      reject(err instanceof Error ? err : new Error(String(err)));
     } finally {
       this.isPlaying = false;
-      resolve();
-      // Process next in queue
       this.processQueue();
     }
   }
 
   cleanup(): void {
-    try {
-      if (existsSync(this.filePath)) {
-        unlinkSync(this.filePath);
-      }
-    } catch {
-      // Best effort
-    }
+    this.page = null;
+    this.queue = [];
   }
 }

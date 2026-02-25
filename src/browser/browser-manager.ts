@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { getConfig } from "../config/index.js";
 import { logger } from "../utils/logger.js";
 import { BrowserError } from "../utils/errors.js";
+import { injectAudioStream } from "../audio/stream-injector.js";
 
 const CHROME_FLAGS = [
   "--use-fake-device-for-media-stream",
@@ -20,7 +21,6 @@ export class BrowserManager {
 
   async launchPersistentContext(options?: {
     headed?: boolean;
-    fakeAudioPath?: string;
   }): Promise<BrowserContext> {
     const config = getConfig();
     const userDataDir = config.chromeUserDataDir;
@@ -30,10 +30,6 @@ export class BrowserManager {
     }
 
     const args = [...CHROME_FLAGS];
-
-    if (options?.fakeAudioPath) {
-      args.push(`--use-file-for-fake-audio-capture=${options.fakeAudioPath}`);
-    }
 
     logger.info("Launching persistent browser context", {
       userDataDir,
@@ -51,6 +47,9 @@ export class BrowserManager {
         viewport: { width: 1280, height: 720 },
       });
 
+      // Inject audio stream monkey-patch BEFORE any page navigates to Meet
+      await injectAudioStream(context);
+
       return context;
     } catch (err) {
       throw new BrowserError(`Failed to launch browser: ${err instanceof Error ? err.message : err}`);
@@ -59,16 +58,11 @@ export class BrowserManager {
 
   async launch(options?: {
     headed?: boolean;
-    fakeAudioPath?: string;
   }): Promise<Browser> {
     if (this.browser?.isConnected()) return this.browser;
 
     const config = getConfig();
     const args = [...CHROME_FLAGS];
-
-    if (options?.fakeAudioPath) {
-      args.push(`--use-file-for-fake-audio-capture=${options.fakeAudioPath}`);
-    }
 
     logger.info("Launching browser", { headed: options?.headed ?? false });
 
@@ -89,7 +83,6 @@ export class BrowserManager {
   async createPage(context: BrowserContext): Promise<Page> {
     const page = await context.newPage();
 
-    // Grant permissions for media
     await context.grantPermissions(["microphone", "camera"], {
       origin: "https://meet.google.com",
     });

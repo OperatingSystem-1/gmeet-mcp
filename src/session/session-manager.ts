@@ -14,16 +14,8 @@ export class SessionManager {
 
     logger.info("Creating session", { id, meetUrl });
 
-    // Each session gets its own persistent browser context
-    const audioInjector = new AudioInjector();
-    const fakeAudioPath = audioInjector.getFilePath();
-
-    // Initialize silence so the browser has a valid WAV to read
-    await audioInjector.writeSilence(1);
-
     const context = await browserManager.launchPersistentContext({
       headed: false,
-      fakeAudioPath,
     });
 
     const page = context.pages()[0] || (await context.newPage());
@@ -34,6 +26,11 @@ export class SessionManager {
     });
 
     const meetPage = new MeetPage(page);
+
+    // AudioInjector now works via the page's Web Audio API
+    const audioInjector = new AudioInjector();
+    audioInjector.setPage(page);
+
     const session = new Session(id, meetUrl, context, meetPage);
     session.audioInjector = audioInjector;
 

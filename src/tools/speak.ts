@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { sessionManager } from "../session/session-manager.js";
 import { OpenAITTS } from "../audio/tts-openai.js";
-import { estimateDuration } from "../audio/wav-utils.js";
 import { logger } from "../utils/logger.js";
 
 export const speakSchema = z.object({
@@ -35,10 +34,9 @@ export async function speak(args: z.infer<typeof speakSchema>) {
 
   // Generate TTS audio
   const wavBuffer = await tts.synthesize(text, voice);
-  const duration = estimateDuration(wavBuffer);
 
-  // Inject audio into the meeting
-  await session.audioInjector.injectAudio(wavBuffer);
+  // Play audio through the Web Audio API bridge → WebRTC → participants
+  const duration = await session.audioInjector.injectAudio(wavBuffer);
 
   return {
     sessionId,
