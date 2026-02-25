@@ -13,7 +13,10 @@ export class Transcriber {
 
   constructor() {
     const config = getConfig();
-    this.client = new OpenAI({ apiKey: config.openaiApiKey });
+    this.client = new OpenAI({
+      apiKey: config.audioApiKey,
+      baseURL: config.audioBaseUrl,
+    });
   }
 
   async transcribe(audioBuffer: Buffer, format: string = "webm"): Promise<TranscriptionResult> {

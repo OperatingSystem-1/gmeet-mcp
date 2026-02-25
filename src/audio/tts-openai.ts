@@ -9,7 +9,10 @@ export class OpenAITTS implements TTSEngine {
 
   constructor() {
     const config = getConfig();
-    this.client = new OpenAI({ apiKey: config.openaiApiKey });
+    this.client = new OpenAI({
+      apiKey: config.audioApiKey,
+      baseURL: config.audioBaseUrl,
+    });
   }
 
   async synthesize(text: string, voice?: string): Promise<Buffer> {

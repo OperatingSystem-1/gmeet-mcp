@@ -4,7 +4,9 @@ import { homedir } from "node:os";
 import { setLogLevel } from "../utils/logger.js";
 
 export interface Config {
-  openaiApiKey: string;
+  audioApiKey: string;
+  audioBaseUrl: string;
+  audioProvider: "openai" | "groq";
   chromeExecutablePath?: string;
   chromeUserDataDir: string;
   ttsVoice: string;
@@ -32,16 +34,25 @@ export function getConfig(): Config {
 
   const file = loadConfigFile();
 
+  // Determine audio provider: prefer Groq if GROQ_API_KEY is set, else OpenAI
+  const groqKey = process.env.GROQ_API_KEY ?? "";
+  const openaiKey = process.env.OPENAI_API_KEY ?? file.audioApiKey ?? "";
+  const useGroq = !!groqKey || process.env.AUDIO_PROVIDER === "groq";
+
   _config = {
-    openaiApiKey: process.env.OPENAI_API_KEY ?? file.openaiApiKey ?? "",
+    audioApiKey: useGroq ? groqKey : openaiKey,
+    audioBaseUrl: useGroq
+      ? "https://api.groq.com/openai/v1"
+      : (process.env.AUDIO_BASE_URL ?? "https://api.openai.com/v1"),
+    audioProvider: useGroq ? "groq" : "openai",
     chromeExecutablePath: process.env.CHROME_EXECUTABLE_PATH ?? file.chromeExecutablePath,
     chromeUserDataDir:
       process.env.CHROME_USER_DATA_DIR ??
       file.chromeUserDataDir ??
       join(homedir(), ".gmeet-mcp", "chrome-profile"),
-    ttsVoice: process.env.TTS_VOICE ?? file.ttsVoice ?? "alloy",
-    ttsModel: process.env.TTS_MODEL ?? file.ttsModel ?? "gpt-4o-mini-tts",
-    whisperModel: process.env.WHISPER_MODEL ?? file.whisperModel ?? "whisper-1",
+    ttsVoice: process.env.TTS_VOICE ?? file.ttsVoice ?? (useGroq ? "austin" : "alloy"),
+    ttsModel: process.env.TTS_MODEL ?? file.ttsModel ?? (useGroq ? "canopylabs/orpheus-v1-english" : "gpt-4o-mini-tts"),
+    whisperModel: process.env.WHISPER_MODEL ?? file.whisperModel ?? (useGroq ? "whisper-large-v3-turbo" : "whisper-1"),
     logLevel: (process.env.LOG_LEVEL ?? file.logLevel ?? "info") as Config["logLevel"],
   };
 
