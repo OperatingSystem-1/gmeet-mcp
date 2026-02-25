@@ -54,14 +54,27 @@ export class MeetPage {
     await injectChatObserver(this.page);
 
     // Take over the audio track on the WebRTC connection
-    // so we can stream TTS audio to all participants
-    try {
-      await takeOverAudioTrack(this.page);
-      logger.info("Audio track takeover successful");
-    } catch (err) {
-      logger.warn("Audio track takeover failed — TTS speak will not work", {
-        error: String(err),
-      });
+    // so we can stream TTS audio to all participants.
+    // Retry a few times since WebRTC connections may take a moment to establish.
+    let audioTakeoverSuccess = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await takeOverAudioTrack(this.page);
+        logger.info("Audio track takeover successful", { attempt });
+        audioTakeoverSuccess = true;
+        break;
+      } catch (err) {
+        logger.warn(`Audio track takeover attempt ${attempt}/3 failed`, {
+          error: String(err),
+        });
+        if (attempt < 3) {
+          await this.page.waitForTimeout(3000);
+        }
+      }
+    }
+
+    if (!audioTakeoverSuccess) {
+      logger.error("All audio track takeover attempts failed — TTS speak will not work");
     }
 
     logger.info("Successfully joined meeting");

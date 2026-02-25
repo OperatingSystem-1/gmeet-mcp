@@ -13,6 +13,7 @@ import { raiseHandSchema, raiseHand } from "./tools/raise-hand.js";
 import { reactSchema, react } from "./tools/react.js";
 import { authenticate } from "./tools/authenticate.js";
 import { takeScreenshotSchema, takeScreenshot } from "./tools/take-screenshot.js";
+import { audioDiagnosticsSchema, audioDiagnostics } from "./tools/audio-diagnostics.js";
 import { logger } from "./utils/logger.js";
 
 function wrapHandler<T>(fn: (args: T) => Promise<any>) {
@@ -130,5 +131,12 @@ export function registerTools(server: McpServer) {
     wrapHandler(takeScreenshot),
   );
 
-  logger.info("All tools registered", { count: 14 });
+  server.tool(
+    "audio_diagnostics",
+    "Get detailed audio pipeline diagnostics for a meeting session — useful for debugging TTS/speak issues.",
+    audioDiagnosticsSchema.shape,
+    wrapHandler(audioDiagnostics),
+  );
+
+  logger.info("All tools registered", { count: 15 });
 }
